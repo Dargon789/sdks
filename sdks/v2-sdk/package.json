@@ -42,7 +42,7 @@
     "eslint-plugin-import": "^2.22.0",
     "jest": "28.0.0",
     "prettier": "^2.4.1",
-    "tsdx": "^0.14.1",
+    "tsdx": "^2.0.0",
     "typescript": "^4.3.3"
   },
   "prettier": {
