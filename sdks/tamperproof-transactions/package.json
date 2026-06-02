@@ -1,0 +1,57 @@
+{
+  "name": "@uniswap/tamperproof-transactions",
+  "version": "2.0.0",
+  "type": "module",
+  "main": "./lib/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist/**",
+    "lib/**"
+  ],
+  "repository": "https://github.com/Uniswap/sdks.git",
+  "author": "Uniswap Labs Security <security@uniswap.org>",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^18.7.16",
+    "@typescript-eslint/eslint-plugin": "^8.38.0",
+    "@typescript-eslint/parser": "^8.38.0",
+    "eslint": "^8.57.0",
+    "eslint-config-prettier": "^9.1.0",
+    "eslint-plugin-prettier": "^3.4.1",
+    "prettier": "^2.4.1",
+    "typescript": "^4.3.3"
+  },
+  "scripts": {
+    "build:cjs": "tsc -p tsconfig.browserify.json",
+    "build:esm": "tsc -p tsconfig.json",
+    "build:browser:unminified": "bun build ./lib/index.js --outfile=dist/_twist.cjs --target=browser --format=cjs && node scripts/wrap-umd.cjs dist/_twist.cjs dist/twist.js twist && rm dist/_twist.cjs",
+    "build:browser:minified": "bun build ./lib/index.js --outfile=dist/_twist.min.cjs --target=browser --format=cjs --minify && node scripts/wrap-umd.cjs dist/_twist.min.cjs dist/twist.min.js twist && rm dist/_twist.min.cjs",
+    "build:browser": "bun run build:browser:unminified && bun run build:browser:minified",
+    "build": "bun run build:cjs && bun run build:esm && bun run build:browser",
+    "test": "bun test",
+    "lint": "eslint src --ext .ts --ignore-pattern '*.test.ts'",
+    "lint:fix": "eslint src --ext .ts --fix",
+    "format": "prettier --write src/**/*.ts",
+    "prepack": "bun run build",
+    "release": "changeset publish"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./lib/index.js"
+    }
+  },
+  "browser": {
+    "./lib/utils/webcrypto.js": "./lib/utils/crypto-browser-shim.js",
+    "node:crypto": false
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "dependencies": {
+    "dohjs": "^0.3.3"
+  }
+}
