@@ -19,14 +19,51 @@ import {
 } from '@uniswap/v4-sdk'
 import { Trade as RouterTrade } from '@uniswap/router-sdk'
 import { Currency, TradeType, Percent, CHAIN_TO_ADDRESSES_MAP, SupportedChainsType } from '@uniswap/sdk-core'
-import { UniswapTrade, SwapOptions } from './entities/actions/uniswap'
+import { UniswapTrade, SwapOptions, TokenTransferMode } from './entities/actions/uniswap'
+import { AcrossV4DepositV3Params } from './entities/actions/across'
+import { SwapSpecification, SwapStep } from './types/encodeSwaps'
 import { RoutePlanner, CommandType } from './utils/routerCommands'
 import { encodePermit, encodeV3PositionPermit } from './utils/inputTokens'
-import { UNIVERSAL_ROUTER_ADDRESS, UniversalRouterVersion } from './utils/constants'
+import {
+  ETH_ADDRESS,
+  ROUTER_AS_RECIPIENT,
+  UNIVERSAL_ROUTER_ADDRESS,
+  UniversalRouterVersion,
+  isAtLeastV2_1_1,
+} from './utils/constants'
+import { getCurrencyAddress } from './utils/getCurrencyAddress'
+import { encodeFee1e18, encodeFeeBips } from './utils/numbers'
+import { encodeSwapStep } from './utils/encodeSwapStep'
+import { computeEncodeSwapsAmounts } from './utils/computeEncodeSwapsAmounts'
+import { normalizeEncodeSwapsSpec } from './utils/normalizeEncodeSwapsSpec'
+import { validateEncodeSwaps } from './utils/validateEncodeSwaps'
+import { getUniversalRouterDomain, EXECUTE_SIGNED_TYPES, generateNonce } from './utils/eip712'
+import { TypedDataDomain, TypedDataField } from '@ethersproject/abstract-signer'
 
 export type SwapRouterConfig = {
   sender?: string // address
   deadline?: BigNumberish
+}
+
+export type SignedRouteOptions = {
+  intent: string // bytes32 - application-specific intent identifier
+  data: string // bytes32 - application-specific data
+  sender: string // msg.sender to verify, or address(0) to skip sender verification
+  nonce?: string // bytes32 - optional nonce. If not provided, random nonce is generated. Use NONCE_SKIP_CHECK to skip nonce verification
+}
+
+export type EIP712Payload = {
+  domain: TypedDataDomain
+  types: Record<string, TypedDataField[]>
+  value: {
+    commands: string
+    inputs: string[]
+    intent: string
+    data: string
+    sender: string
+    nonce: string
+    deadline: string
+  }
 }
 
 export interface MigrateV3ToV4Options {
@@ -36,6 +73,8 @@ export interface MigrateV3ToV4Options {
   v4AddLiquidityOptions: V4AddLiquidityOptions
 }
 
+const DEFAULT_PROXY_DEADLINE_BUFFER_SECONDS = 30 * 60
+
 function isMint(options: V4AddLiquidityOptions): options is MintOptions {
   return Object.keys(options).some((k) => k === 'recipient')
 }
@@ -43,9 +82,14 @@ function isMint(options: V4AddLiquidityOptions): options is MintOptions {
 export abstract class SwapRouter {
   public static INTERFACE: Interface = new Interface(UniversalRouter.abi)
 
+  public static PROXY_INTERFACE: Interface = new Interface([
+    'function execute(address router, address token, uint256 amount, bytes calldata commands, bytes[] calldata inputs, uint256 deadline) external',
+  ])
+
   public static swapCallParameters(
     trades: RouterTrade<Currency, Currency, TradeType>,
-    options: SwapOptions
+    options: SwapOptions,
+    bridgeOptions?: AcrossV4DepositV3Params[] // Optional bridge parameters
   ): MethodParameters {
     // TODO: use permit if signature included in swapOptions
     const planner = new RoutePlanner()
@@ -53,10 +97,17 @@ export abstract class SwapRouter {
     const trade: UniswapTrade = new UniswapTrade(trades, options)
 
     const inputCurrency = trade.trade.inputAmount.currency
-    invariant(!(inputCurrency.isNative && !!options.inputTokenPermit), 'NATIVE_INPUT_PERMIT')
 
-    if (options.inputTokenPermit) {
-      encodePermit(planner, options.inputTokenPermit)
+    if (options.tokenTransferMode === TokenTransferMode.ApproveProxy) {
+      invariant(!inputCurrency.isNative, 'PROXY_NATIVE_INPUT: SwapProxy only supports ERC20 input')
+      invariant(!!options.chainId, 'PROXY_MISSING_CHAIN_ID: chainId required when tokenTransferMode is ApproveProxy')
+      invariant(!options.inputTokenPermit, 'PROXY_PERMIT_CONFLICT: Permit2 not used with SwapProxy')
+    } else {
+      invariant(!(inputCurrency.isNative && !!options.inputTokenPermit), 'NATIVE_INPUT_PERMIT')
+
+      if (options.inputTokenPermit) {
+        encodePermit(planner, options.inputTokenPermit)
+      }
     }
 
     const nativeCurrencyValue = inputCurrency.isNative
@@ -64,9 +115,258 @@ export abstract class SwapRouter {
       : BigNumber.from(0)
 
     trade.encode(planner, { allowRevert: false })
+
+    // Add bridge commands if provided
+    if (bridgeOptions) {
+      for (const bridge of bridgeOptions) {
+        planner.addAcrossBridge(bridge)
+      }
+    }
+
+    if (options.tokenTransferMode === TokenTransferMode.ApproveProxy) {
+      return SwapRouter.encodeProxyPlan(planner, trade, options)
+    }
+
     return SwapRouter.encodePlan(planner, nativeCurrencyValue, {
       deadline: options.deadlineOrPreviousBlockhash ? BigNumber.from(options.deadlineOrPreviousBlockhash) : undefined,
     })
+  }
+
+  /**
+   * Encodes router-provided swap steps inside the SDK safety envelope.
+   *
+   * Routers own `swapSteps` (V2/V3/V4 swaps, plus any `WRAP_ETH` / `UNWRAP_WETH` required by the route).
+   * The SDK owns ingress, fees, final settlement, exact-output refund, and optional `safeMode`.
+   *
+   * Router contract: end with final output in `spec.routing.outputToken`; for `EXACT_OUTPUT`, unused input
+   * must end in `spec.routing.inputToken`. Don't include a top-level `SWEEP` — the SDK appends settlement,
+   * refund, and safeMode sweeps itself.
+   *
+   * Router custody with `payerIsUser = false` is deliberate for safety, even if it costs an extra command
+   * or transfer; the SDK does not infer route topology on behalf of routers.
+   */
+  public static encodeSwaps(spec: SwapSpecification, swapSteps: SwapStep[]): MethodParameters {
+    const normalizedSpec = normalizeEncodeSwapsSpec(spec)
+    const planner = new RoutePlanner()
+
+    validateEncodeSwaps(normalizedSpec, swapSteps)
+
+    const { exactOrMaxAmountIn, netMinOrExactAmountOut } = computeEncodeSwapsAmounts(normalizedSpec)
+    const {
+      routing: { inputToken, outputToken },
+    } = normalizedSpec
+
+    // Ingress: pull funds into the router. Native input is paid as msg.value at the bottom
+    // instead of via Permit2; ApproveProxy ingress is handled by the outer wrapper at the end.
+    if (normalizedSpec.tokenTransferMode === TokenTransferMode.Permit2) {
+      if (normalizedSpec.permit) {
+        encodePermit(planner, normalizedSpec.permit)
+      }
+
+      if (!inputToken.isNative) {
+        planner.addCommand(
+          CommandType.PERMIT2_TRANSFER_FROM,
+          [getCurrencyAddress(inputToken), ROUTER_AS_RECIPIENT, exactOrMaxAmountIn],
+          false,
+          normalizedSpec.urVersion
+        )
+      }
+    }
+
+    for (const step of swapSteps) {
+      encodeSwapStep(planner, step, normalizedSpec.urVersion)
+    }
+
+    // Fee deducted from gross output before final settlement.
+    // Portion uses 1e18 precision on >=v2.1.1 and bps on v2.0; flat is a plain TRANSFER.
+    if (normalizedSpec.fee?.kind === 'portion') {
+      const feeCommandType = isAtLeastV2_1_1(normalizedSpec.urVersion)
+        ? CommandType.PAY_PORTION_FULL_PRECISION
+        : CommandType.PAY_PORTION
+      const encodedFee = isAtLeastV2_1_1(normalizedSpec.urVersion)
+        ? encodeFee1e18(normalizedSpec.fee.fee)
+        : encodeFeeBips(normalizedSpec.fee.fee)
+
+      planner.addCommand(
+        feeCommandType,
+        [getCurrencyAddress(outputToken), normalizedSpec.fee.recipient, encodedFee],
+        false,
+        normalizedSpec.urVersion
+      )
+    } else if (normalizedSpec.fee?.kind === 'flat') {
+      planner.addCommand(
+        CommandType.TRANSFER,
+        [getCurrencyAddress(outputToken), normalizedSpec.fee.recipient, normalizedSpec.fee.amount],
+        false,
+        normalizedSpec.urVersion
+      )
+    }
+
+    // Assumes routers already normalized final gross output into `routing.outputToken`.
+    planner.addCommand(
+      CommandType.SWEEP,
+      [getCurrencyAddress(outputToken), normalizedSpec.recipient, netMinOrExactAmountOut],
+      false,
+      normalizedSpec.urVersion
+    )
+
+    // Assumes routers already normalized unused input into `routing.inputToken`.
+    // Exact-output uses max input, so any unused slippage padding is refunded to the recipient.
+    if (normalizedSpec.tradeType === TradeType.EXACT_OUTPUT) {
+      planner.addCommand(
+        CommandType.SWEEP,
+        [getCurrencyAddress(inputToken), normalizedSpec.recipient, 0],
+        false,
+        normalizedSpec.urVersion
+      )
+    }
+
+    // safeMode: zero-min ETH sweep recovers any native funds left on the router (dust or unintended msg.value)
+    if (normalizedSpec.safeMode) {
+      planner.addCommand(CommandType.SWEEP, [ETH_ADDRESS, normalizedSpec.recipient, 0], false, normalizedSpec.urVersion)
+    }
+
+    // ApproveProxy wraps the inner UR plan in an outer proxy.execute() that handles ingress upstream.
+    if (normalizedSpec.tokenTransferMode === TokenTransferMode.ApproveProxy) {
+      return SwapRouter.encodeProxyCall(
+        planner,
+        getCurrencyAddress(inputToken),
+        exactOrMaxAmountIn,
+        normalizedSpec.chainId!,
+        normalizedSpec.urVersion,
+        normalizedSpec.deadline
+      )
+    }
+
+    // Native input pays via msg.value; ERC20 input is already in the router via Permit2.
+    return SwapRouter.encodePlan(planner, inputToken.isNative ? exactOrMaxAmountIn : BigNumber.from(0), {
+      deadline: normalizedSpec.deadline ? BigNumber.from(normalizedSpec.deadline) : undefined,
+    })
+  }
+
+  /**
+   * Generate EIP712 payload for signed execution (no signing performed)
+   * Decodes existing execute() calldata and prepares it for signing
+   *
+   * @param calldata The calldata from swapCallParameters() or similar
+   * @param signedOptions Options for signed execution (intent, data, sender, nonce)
+   * @param deadline The deadline timestamp
+   * @param chainId The chain ID
+   * @param routerAddress The Universal Router contract address
+   * @returns EIP712 payload ready to be signed externally
+   */
+  public static getExecuteSignedPayload(
+    calldata: string,
+    signedOptions: SignedRouteOptions,
+    deadline: BigNumberish,
+    chainId: number,
+    routerAddress: string
+  ): EIP712Payload {
+    // Decode the execute() calldata to extract commands and inputs
+    // Try to decode with deadline first, then without
+    let decoded: any
+    let commands: string
+    let inputs: string[]
+
+    try {
+      decoded = SwapRouter.INTERFACE.decodeFunctionData('execute(bytes,bytes[],uint256)', calldata)
+      commands = decoded.commands as string
+      inputs = decoded.inputs as string[]
+    } catch (e) {
+      // Try without deadline
+      decoded = SwapRouter.INTERFACE.decodeFunctionData('execute(bytes,bytes[])', calldata)
+      commands = decoded.commands as string
+      inputs = decoded.inputs as string[]
+    }
+
+    // Use provided nonce or generate random one
+    const nonce = signedOptions.nonce || generateNonce()
+
+    // sender is provided directly (address(0) = skip verification)
+    const sender = signedOptions.sender
+
+    const domain = getUniversalRouterDomain(chainId, routerAddress)
+
+    const intent = signedOptions.intent
+
+    const data = signedOptions.data
+
+    const deadlineStr = BigNumber.from(deadline).toString()
+
+    const value = {
+      commands,
+      inputs,
+      intent,
+      data,
+      sender,
+      nonce,
+      deadline: deadlineStr,
+    }
+
+    return {
+      domain,
+      types: EXECUTE_SIGNED_TYPES,
+      value,
+    }
+  }
+
+  /**
+   * Encode executeSigned() call with signature
+   *
+   * @param calldata The original calldata from swapCallParameters()
+   * @param signature The signature obtained from external signing
+   * @param signedOptions The same options used in getExecuteSignedPayload()
+   * @param deadline The deadline timestamp
+   * @param nativeCurrencyValue The native currency value (ETH) to send
+   * @returns Method parameters for executeSigned()
+   */
+  public static encodeExecuteSigned(
+    calldata: string,
+    signature: string,
+    signedOptions: SignedRouteOptions,
+    deadline: BigNumberish,
+    nativeCurrencyValue: BigNumber = BigNumber.from(0)
+  ): MethodParameters {
+    // Decode the execute() calldata to extract commands and inputs
+    // Try to decode with deadline first, then without
+    let decoded: any
+    let commands: string
+    let inputs: string[]
+
+    try {
+      decoded = SwapRouter.INTERFACE.decodeFunctionData('execute(bytes,bytes[],uint256)', calldata)
+      commands = decoded.commands as string
+      inputs = decoded.inputs as string[]
+    } catch (e) {
+      // Try without deadline
+      decoded = SwapRouter.INTERFACE.decodeFunctionData('execute(bytes,bytes[])', calldata)
+      commands = decoded.commands as string
+      inputs = decoded.inputs as string[]
+    }
+
+    // Use provided nonce (must match what was signed)
+    // Nonce must match what was signed - require it to be provided
+    if (!signedOptions.nonce) {
+      throw new Error('Nonce is required for encodeExecuteSigned - use the nonce from getExecuteSignedPayload')
+    }
+    const nonce = signedOptions.nonce
+
+    // Determine verifySender based on sender address
+    const verifySender = signedOptions.sender !== '0x0000000000000000000000000000000000000000'
+
+    // Encode executeSigned function call using the Universal Router v2.1 ABI
+    const signedCalldata = SwapRouter.INTERFACE.encodeFunctionData('executeSigned', [
+      commands,
+      inputs,
+      signedOptions.intent,
+      signedOptions.data,
+      verifySender,
+      nonce,
+      signature,
+      deadline,
+    ])
+
+    return { calldata: signedCalldata, value: nativeCurrencyValue.toHexString() }
   }
 
   /**
@@ -191,5 +491,46 @@ export abstract class SwapRouter {
     const parameters = !!config.deadline ? [commands, inputs, config.deadline] : [commands, inputs]
     const calldata = SwapRouter.INTERFACE.encodeFunctionData(functionSignature, parameters)
     return { calldata, value: nativeCurrencyValue.toHexString() }
+  }
+
+  /**
+   * Wraps an inner UR plan in calldata targeting the SwapProxy contract.
+   * The proxy pulls ERC20 tokens from the user into the UR, then executes commands.
+   */
+  private static encodeProxyPlan(planner: RoutePlanner, trade: UniswapTrade, options: SwapOptions): MethodParameters {
+    return SwapRouter.encodeProxyCall(
+      planner,
+      (trade.trade.inputAmount.currency as { address: string }).address,
+      BigNumber.from(trade.trade.maximumAmountIn(options.slippageTolerance).quotient.toString()),
+      options.chainId!,
+      options.urVersion ?? UniversalRouterVersion.V2_0,
+      options.deadlineOrPreviousBlockhash ? BigNumber.from(options.deadlineOrPreviousBlockhash) : undefined
+    )
+  }
+
+  private static encodeProxyCall(
+    planner: RoutePlanner,
+    inputToken: string,
+    inputAmount: BigNumber,
+    chainId: number,
+    urVersion: UniversalRouterVersion,
+    deadline?: BigNumberish
+  ): MethodParameters {
+    const { commands, inputs } = planner
+    const routerAddress = UNIVERSAL_ROUTER_ADDRESS(urVersion, chainId)
+    const resolvedDeadline = deadline
+      ? BigNumber.from(deadline)
+      : BigNumber.from(Math.floor(Date.now() / 1000) + DEFAULT_PROXY_DEADLINE_BUFFER_SECONDS) // 30 min default
+
+    const calldata = SwapRouter.PROXY_INTERFACE.encodeFunctionData('execute', [
+      routerAddress,
+      inputToken,
+      inputAmount,
+      commands,
+      inputs,
+      resolvedDeadline,
+    ])
+
+    return { calldata, value: BigNumber.from(0).toHexString() }
   }
 }
