@@ -42,5 +42,25 @@ describe('addresses', () => {
       const address = SWAP_ROUTER_02_ADDRESSES(ChainId.BLAST)
       expect(address).toEqual('0x549FEB8c9bd4c12Ad2AB27022dA12492aC452B66')
     })
+
+    it('should return the correct address for xlayer', () => {
+      const address = SWAP_ROUTER_02_ADDRESSES(ChainId.XLAYER)
+      expect(address).toEqual('0x4f0c28f5926afda16bf2506d5d9e57ea190f9bca')
+    })
+
+    it('should return the correct address for linea', () => {
+      const address = SWAP_ROUTER_02_ADDRESSES(ChainId.LINEA)
+      expect(address).toEqual('0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a')
+    })
+
+    it('should return the correct address for tempo', () => {
+      const address = SWAP_ROUTER_02_ADDRESSES(ChainId.TEMPO)
+      expect(address).toEqual('0x7e9d53081e961201837336bcd81f52ae92691a8f')
+    })
+
+    it('should return the correct address for megaeth', () => {
+      const address = SWAP_ROUTER_02_ADDRESSES(ChainId.MEGAETH)
+      expect(address).toEqual('0x48020de9208bafc183f5cad5118ffbe8f0f913f5')
+    })
   })
 })
