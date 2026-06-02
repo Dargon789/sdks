@@ -1,7 +1,5 @@
 # .yarn files
-.yarn/cache
-.yarn/versions
-.yarn/install-state.gz
+.yarn/
 
 # Turbo
 .turbo
@@ -11,3 +9,6 @@ node_modules
 
 # Intellij IDEA artifacts
 .idea/
+
+# spec workflow mcp from Uniswap
+.spec-workflow/
