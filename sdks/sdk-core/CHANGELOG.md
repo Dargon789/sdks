@@ -1,5 +1,33 @@
 # @uniswap/sdk-core
 
+## 7.17.0
+
+### Minor Changes
+
+- ca82bac: Add Robinhood (4663) and Arc (5042) chain and Universal Router deployment config.
+
+  Also corrects `ChainId.ROBINHOOD` from `46630` to `4663` to match the canonical Robinhood
+  mainnet chain ID used across Uniswap's backend and the contracts deployments repo. Robinhood
+  had no addresses wired up previously, so this is shipped as a minor bump.
+
+## 7.16.1
+
+### Patch Changes
+
+- Add mainnet permissioned V4 position manager address and update sepolia permissioned V4 position manager address (perm-pool redeploy)
+
+## 7.16.0
+
+### Minor Changes
+
+- Add UniversalRouterVersion V2_2_0 (Sepolia) with permissioned-pool support
+
+## 7.15.0
+
+### Minor Changes
+
+- 0e30be1: Add MegaETH chain and Universal Router deployment config
+
 ## 7.13.0
 
 ### Minor Changes

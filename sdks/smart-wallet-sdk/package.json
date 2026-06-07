@@ -1,6 +1,6 @@
 {
   "name": "@uniswap/smart-wallet-sdk",
-  "version": "2.5.2",
+  "version": "2.6.4",
   "description": "⚒️ An SDK for building applications with smart wallets on Uniswap",
   "repository": "https://github.com/Uniswap/sdks.git",
   "keywords": [
@@ -44,7 +44,7 @@
     "@types/node": "^18.7.16",
     "@typescript-eslint/eslint-plugin": "^8.38.0",
     "@typescript-eslint/parser": "^8.38.0",
-    "eslint": "^9.26.0",
+    "eslint": "^8.57.0",
     "eslint-config-prettier": "^9.1.0",
     "eslint-plugin-eslint-comments": "^3.2.0",
     "eslint-plugin-functional": "^3.0.2",
